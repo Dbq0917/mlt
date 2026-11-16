@@ -44,3 +44,12 @@ parameters:
     description: >
       A properties or YAML file specifying multiple consumers and their properties.
     required: no
+
+  - identifier: shutdown_timeout
+    title: Shutdown timeout
+    type: integer
+    description: >
+      Maximum time in milliseconds to wait for a nested consumer to finish
+      before forcing it to stop. Defaults to 10000 ms.
+    readonly: no
+    minimum: 1

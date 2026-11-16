@@ -1123,7 +1123,10 @@ int main(int argc, char **argv)
                 transport(melt, consumer);
 
                 // Stop the consumer
-                mlt_consumer_stop(consumer);
+                if (mlt_consumer_stop(consumer) != 0 && !error)
+                    error = EXIT_FAILURE;
+            } else {
+                error = EXIT_FAILURE;
             }
         } else if (store != NULL && store != stdout && name != NULL) {
             fprintf(stderr, "Project saved as %s.\n", name);
@@ -1136,19 +1139,67 @@ int main(int argc, char **argv)
     }
 
     // Disconnect producer from consumer to prevent ref cycles from closing services
-    if (consumer && !error) {
-        error = mlt_properties_get_int(MLT_CONSUMER_PROPERTIES(consumer), "melt_error");
+    if (consumer) {
+        int consumer_error = mlt_properties_get_int(MLT_CONSUMER_PROPERTIES(consumer),
+                                                    "melt_error");
+        if (consumer_error && !error)
+            error = EXIT_FAILURE;
         mlt_consumer_connect(consumer, NULL);
     }
 
     // Flush all open writable streams
     fflush(NULL);
 
-    // Interrupted by a signal: the render is incomplete. Restore the default
-    // handler and re-raise so the exit status reflects the signal (e.g. 130 for
-    // SIGINT), mirroring abnormal_exit_handler above. (#547)
+    // Interrupted by a signal: the render is incomplete. Surface that in the
+    // summary and exit status, but clean up below before re-raising so GPU
+    // resources and output files are handled deterministically.
     sig_atomic_t signum = stop_signum;
-    if (signum && !error) {
+    if (signum && !error)
+        error = EXIT_FAILURE;
+
+    // Report a machine-readable result for the render farm monitor. Keep this
+    // before closing the consumer so the integrity counters are still valid.
+    int64_t rendered_frames = 0;
+    double rendered_duration = 0.0;
+    if (consumer) {
+        rendered_frames = mlt_properties_get_int64(MLT_CONSUMER_PROPERTIES(consumer),
+                                                   "_rendered_frames");
+        rendered_duration = mlt_properties_get_double(MLT_CONSUMER_PROPERTIES(consumer),
+                                                      "_rendered_duration");
+    }
+    fprintf(stderr,
+            "render_status=%s exit_code=%d frames=%lld duration=%.3f\n",
+            error ? "failure" : "success",
+            error ? EXIT_FAILURE : EXIT_SUCCESS,
+            (long long) rendered_frames,
+            rendered_duration);
+
+    // Release services and factory resources explicitly. In particular this
+    // tears down OpenGL/Vulkan contexts and textures before returning to the
+    // shell instead of relying on the OS to reclaim GPU memory at process exit.
+    if (consumer) {
+        mlt_consumer_close(consumer);
+        consumer = NULL;
+    }
+    if (melt) {
+        mlt_producer_close(melt);
+        melt = NULL;
+    }
+    if (backup_profile) {
+        mlt_profile_close(backup_profile);
+        backup_profile = NULL;
+    }
+    if (profile) {
+        mlt_profile_close(profile);
+        profile = NULL;
+    }
+    if (repo)
+        mlt_factory_close();
+
+    // Restore the default handler and re-raise so the exit status reflects the
+    // signal (e.g. 130 for SIGINT), mirroring abnormal_exit_handler above. This
+    // happens after cleanup and output finalization. (#547)
+    if (signum) {
 #ifndef _WIN32
         abnormal_exit_handler(signum);
 #endif

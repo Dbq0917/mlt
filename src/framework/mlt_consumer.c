@@ -613,16 +613,23 @@ int mlt_consumer_put_frame(mlt_consumer self, mlt_frame frame)
         struct timespec tm;
         consumer_private *priv = self->local;
 
+        // A consumer that already stopped will not drain its put slot. Do not
+        // block the producer for up to a second per frame in that case.
+        if (mlt_consumer_is_stopped(self)) {
+            mlt_frame_close(frame);
+            return error;
+        }
+
         mlt_properties_set_int(MLT_CONSUMER_PROPERTIES(self), "put_pending", 1);
         pthread_mutex_lock(&priv->put_mutex);
-        while (priv->put_active && priv->put != NULL) {
+        while (priv->put_active && priv->put != NULL && !mlt_consumer_is_stopped(self)) {
             gettimeofday(&now, NULL);
             tm.tv_sec = now.tv_sec + 1;
             tm.tv_nsec = now.tv_usec * 1000;
             pthread_cond_timedwait(&priv->put_cond, &priv->put_mutex, &tm);
         }
         mlt_properties_set_int(MLT_CONSUMER_PROPERTIES(self), "put_pending", 0);
-        if (priv->put_active && priv->put == NULL)
+        if (priv->put_active && priv->put == NULL && !mlt_consumer_is_stopped(self))
             priv->put = frame;
         else
             mlt_frame_close(frame);
@@ -831,7 +838,7 @@ static void *consumer_read_ahead_thread(void *arg)
 
     // Get the first frame
     frame = mlt_consumer_get_frame(self);
-    if (priv->speed != mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "_speed")) {
+    if (frame && priv->speed != mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "_speed")) {
         priv->speed = mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "_speed");
         // get_frame might want to recalculate the minimum queue size if the speed has changed.
         pthread_cond_broadcast(&priv->queue_cond);
@@ -1440,8 +1447,10 @@ static mlt_frame worker_get_frame(mlt_consumer self, mlt_properties properties)
         set_image_format(self);
         consumer_work_start(self);
 
-        // Fill the work queue.
+        // Fill the work queue. Track how many frames were actually available so
+        // shutdown can not wait for a prefill level that the source can not reach.
         int i = buffer;
+        int fed = 0;
         while (priv->ahead && i--) {
             frame = mlt_consumer_get_frame(self);
             if (frame) {
@@ -1463,11 +1472,18 @@ static mlt_frame worker_get_frame(mlt_consumer self, mlt_properties properties)
                 pthread_mutex_unlock(&priv->queue_mutex);
                 priv->speed = mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "_speed");
                 buffer = (priv->speed == 0) ? 1 : buffer;
+                fed++;
+            } else {
+                break;
             }
         }
 
-        // Wait for prefill
-        while (priv->ahead && first_unprocessed_frame(self) < prefill) {
+        // Wait for prefill, but never wait for more frames than were supplied.
+        // A put-mode consumer may be stopped after only a single termination
+        // frame was queued, for example. Waiting for the configured buffer
+        // size in that case deadlocks the render thread.
+        int prefill_target = MIN(prefill, fed);
+        while (priv->ahead && first_unprocessed_frame(self) < prefill_target) {
             pthread_mutex_lock(&priv->done_mutex);
             pthread_cond_wait(&priv->done_cond, &priv->done_mutex);
             pthread_mutex_unlock(&priv->done_mutex);
@@ -1503,8 +1519,10 @@ static mlt_frame worker_get_frame(mlt_consumer self, mlt_properties properties)
         }
     }
 
-    // Wait if not realtime.
+    // Wait if not realtime. There may be no frame at all when the source ended
+    // or a put-mode consumer is stopping; do not dereference an empty queue.
     while (priv->ahead && priv->real_time < 0 && !priv->is_purge
+           && mlt_deque_count(priv->queue)
            && !(mlt_properties_get_int(MLT_FRAME_PROPERTIES(
                                            MLT_FRAME(mlt_deque_peek_front(priv->queue))),
                                        "rendered"))) {

@@ -266,6 +266,16 @@ parameters:
     maximum: 16
     default: 0
 
+  - identifier: verify
+    title: Verify output
+    type: boolean
+    description: >
+      Check that the output file duration and video frame count match the
+      rendered result before exiting. Enabled by default for local file output
+      rendered in non-realtime mode.
+    readonly: no
+    default: 1
+
   - identifier: subtitle.0.feed
     title: Feed for subtitle stream 0
     type: string

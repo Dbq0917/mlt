@@ -21,6 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include <gettimeofday.h>
+#else
+#include <sys/time.h>
+#endif
 
 // Forward references
 static int start(mlt_consumer consumer);
@@ -49,6 +54,7 @@ mlt_consumer consumer_multi_init(mlt_profile profile,
         mlt_properties_set(properties, "resource", arg);
         mlt_properties_set_int(properties, "real_time", -1);
         mlt_properties_set_int(properties, "terminate_on_pause", 1);
+        mlt_events_register(properties, "consumer-fatal-error");
 
         // Init state
         mlt_properties_set_int(properties, "joined", 1);
@@ -168,6 +174,16 @@ static void on_frame_show(void *dummy, mlt_properties properties, mlt_event_data
     mlt_events_fire(properties, "consumer-frame-show", event_data);
 }
 
+static void on_child_fatal_error(mlt_properties self,
+                                 mlt_properties parent,
+                                 mlt_event_data event_data)
+{
+    (void) self;
+    (void) event_data;
+    mlt_properties_set_int(parent, "melt_error", 1);
+    mlt_events_fire(parent, "consumer-fatal-error", mlt_event_data_none());
+}
+
 static mlt_consumer generate_consumer(mlt_consumer consumer, mlt_properties props, int index)
 {
     mlt_profile profile = NULL;
@@ -205,6 +221,10 @@ static mlt_consumer generate_consumer(mlt_consumer consumer, mlt_properties prop
         // set mlt_profile before other properties to facilitate presets
         mlt_properties_pass_list(nested_props, props, "mlt_profile");
         mlt_properties_inherit(nested_props, props);
+        mlt_events_listen(nested_props,
+                          properties,
+                          "consumer-fatal-error",
+                          (mlt_listener) on_child_fatal_error);
 
         attach_normalizers(profile, MLT_CONSUMER_SERVICE(nested));
 
@@ -376,6 +396,10 @@ static void foreach_consumer_put(mlt_consumer consumer, mlt_frame frame)
         nested = mlt_properties_get_data(properties, key, NULL);
         if (nested) {
             mlt_properties nested_props = MLT_CONSUMER_PROPERTIES(nested);
+            if (mlt_consumer_is_stopped(nested)
+                || mlt_properties_get_int(nested_props, "melt_error")
+                || mlt_properties_get_int(nested_props, "_output_error"))
+                continue;
             double self_fps = mlt_properties_get_double(properties, "fps");
             double nested_fps = mlt_properties_get_double(nested_props, "fps");
             mlt_position nested_pos = mlt_properties_get_position(nested_props, "_multi_position");
@@ -420,7 +444,9 @@ static void foreach_consumer_put(mlt_consumer consumer, mlt_frame frame)
                           nested_pos,
                           nested_time,
                           self_time);
-            while (nested_time <= self_time) {
+            while (nested_time <= self_time && !mlt_consumer_is_stopped(nested)
+                   && !mlt_properties_get_int(nested_props, "melt_error")
+                   && !mlt_properties_get_int(nested_props, "_output_error")) {
                 // put ideal number of samples into cloned frame
                 int deeply = index > 1 ? 1 : 0;
                 mlt_frame clone_frame = mlt_frame_clone(frame, deeply);
@@ -491,6 +517,12 @@ static void foreach_consumer_stop(mlt_consumer consumer)
     char key[30];
     int index = 0;
     struct timespec tm = {0, 1000 * 1000};
+    int timeout = mlt_properties_get_int(properties, "shutdown_timeout");
+    int64_t total_frames = 0;
+    double total_duration = 0.0;
+    int output_error = 0;
+    if (timeout <= 0)
+        timeout = 10000;
 
     do {
         snprintf(key, sizeof(key), "%d.consumer", index++);
@@ -498,16 +530,52 @@ static void foreach_consumer_stop(mlt_consumer consumer)
         if (nested) {
             // Let consumer with terminate_on_pause stop on their own
             if (mlt_properties_get_int(MLT_CONSUMER_PROPERTIES(nested), "terminate_on_pause")) {
+                struct timeval started;
+                struct timeval now;
+                mlt_frame frame = mlt_frame_init(MLT_CONSUMER_SERVICE(consumer));
+
                 // Send additional dummy frame to unlatch nested consumer's threads
-                mlt_consumer_put_frame(nested, mlt_frame_init(MLT_CONSUMER_SERVICE(consumer)));
-                // wait for stop
-                while (!mlt_consumer_is_stopped(nested))
+                if (frame) {
+                    mlt_properties_set_double(MLT_FRAME_PROPERTIES(frame), "_speed", 0.0);
+                    mlt_consumer_put_frame(nested, frame);
+                }
+
+                // Wait for stop, but never forever. A broken consumer must not
+                // keep the whole render process alive and holding GPU resources.
+                gettimeofday(&started, NULL);
+                while (!mlt_consumer_is_stopped(nested)) {
+                    gettimeofday(&now, NULL);
+                    long elapsed = (now.tv_sec - started.tv_sec) * 1000
+                                   + (now.tv_usec - started.tv_usec) / 1000;
+                    if (elapsed >= timeout) {
+                        mlt_log_error(MLT_CONSUMER_SERVICE(consumer),
+                                      "consumer did not stop within %d ms - forcing stop\n",
+                                      timeout);
+                        break;
+                    }
                     nanosleep(&tm, NULL);
+                }
+                // Even when the nested consumer stopped itself, call stop to
+                // join its render threads and release its resources before the
+                // parent consumer is closed.
+                mlt_consumer_stop(nested);
             } else {
                 mlt_consumer_stop(nested);
             }
+            total_frames += mlt_properties_get_int64(MLT_CONSUMER_PROPERTIES(nested),
+                                                     "_rendered_frames");
+            total_duration += mlt_properties_get_double(MLT_CONSUMER_PROPERTIES(nested),
+                                                        "_rendered_duration");
+            output_error |= mlt_properties_get_int(MLT_CONSUMER_PROPERTIES(nested),
+                                                   "_output_error");
         }
     } while (nested);
+
+    if (total_frames || total_duration > 0.0 || output_error) {
+        mlt_properties_set_int64(properties, "_rendered_frames", total_frames);
+        mlt_properties_set_double(properties, "_rendered_duration", total_duration);
+        mlt_properties_set_int(properties, "_output_error", output_error);
+    }
 }
 
 /** Start the consumer.

@@ -27,6 +27,7 @@
 #include <framework/mlt_profile.h>
 
 // System header files
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,8 +35,11 @@
 #include <time.h>
 
 #ifdef _MSC_VER
+#include <fcntl.h>
 #include <gettimeofday.h>
+#include <io.h>
 #else
+#include <fcntl.h>
 #include <sys/time.h>
 #include <unistd.h>
 #endif
@@ -120,6 +124,12 @@ void sample_fifo_close(sample_fifo fifo)
 {
     free(fifo->buffer);
     free(fifo);
+}
+
+static void fire_fatal_error(mlt_properties properties)
+{
+    mlt_properties_set_int(properties, "_output_error", 1);
+    mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
 }
 
 static AVFilterGraph *vfilter_graph;
@@ -1374,6 +1384,123 @@ typedef struct encode_ctx_desc
     AVPacket *attached_pic_pkt;
 } encode_ctx_t;
 
+static int is_local_file_target(const char *filename)
+{
+    return filename && filename[0] && filename[0] != '-' && strcmp(filename, "pipe:")
+           && !strstr(filename, "://");
+}
+
+/** Flush the file to stable storage before the process exits.
+ *
+ * Closing an AVIOContext flushes libavformat's buffers but does not
+ * necessarily persist the data. Render farms hand the output to the next
+ * stage as soon as the process exits, so make that guarantee explicit.
+ */
+static void sync_output_file(const char *filename)
+{
+    if (!is_local_file_target(filename))
+        return;
+#ifdef _MSC_VER
+    int fd = _open(filename, _O_RDONLY | _O_BINARY);
+    if (fd >= 0) {
+        _commit(fd);
+        _close(fd);
+    }
+#else
+    int fd = open(filename, O_RDONLY);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+#endif
+}
+
+static void remove_output_file(const char *filename)
+{
+    if (is_local_file_target(filename))
+        remove(filename);
+}
+
+/** Verify that the written container contains the frames and duration that
+ * were rendered. This catches truncated files without decoding the media.
+ */
+static int verify_output(mlt_consumer consumer,
+                         const char *filename,
+                         int64_t expected_frames,
+                         double expected_duration,
+                         int64_t *actual_frames,
+                         double *actual_duration)
+{
+    mlt_service service = MLT_CONSUMER_SERVICE(consumer);
+    AVFormatContext *input = NULL;
+    int failed = 0;
+    int video_index = -1;
+
+    *actual_frames = -1;
+    *actual_duration = 0.0;
+
+    if (!is_local_file_target(filename))
+        return 1;
+
+    if (avformat_open_input(&input, filename, NULL, NULL) < 0) {
+        mlt_log_error(service, "integrity check failed: could not open '%s'\n", filename);
+        return -1;
+    }
+    if (avformat_find_stream_info(input, NULL) < 0) {
+        mlt_log_error(service, "integrity check failed: no stream info in '%s'\n", filename);
+        avformat_close_input(&input);
+        return -1;
+    }
+
+    video_index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (video_index >= 0) {
+        AVStream *stream = input->streams[video_index];
+        *actual_frames = stream->nb_frames;
+        if (*actual_frames <= 0) {
+            AVPacket *packet = av_packet_alloc();
+            if (packet) {
+                *actual_frames = 0;
+                while (av_read_frame(input, packet) >= 0) {
+                    if (packet->stream_index == video_index)
+                        (*actual_frames)++;
+                    av_packet_unref(packet);
+                }
+                av_packet_free(&packet);
+            }
+        }
+        if (input->duration > 0) {
+            *actual_duration = input->duration / (double) AV_TIME_BASE;
+        } else if (stream->duration > 0) {
+            *actual_duration = stream->duration * av_q2d(stream->time_base);
+        }
+    } else if (input->duration > 0) {
+        *actual_duration = input->duration / (double) AV_TIME_BASE;
+    }
+
+    if (video_index >= 0 && expected_frames > 0 && *actual_frames >= 0
+        && *actual_frames != expected_frames) {
+        mlt_log_error(service,
+                      "integrity check failed: expected %lld video frames, found %lld\n",
+                      (long long) expected_frames,
+                      (long long) *actual_frames);
+        failed = 1;
+    }
+    if (expected_duration > 0.0 && *actual_duration > 0.0) {
+        double tolerance = expected_duration * 0.02 + 0.1;
+        double difference = fabs(*actual_duration - expected_duration);
+        if (difference > tolerance) {
+            mlt_log_error(service,
+                          "integrity check failed: expected %.3f s, found %.3f s\n",
+                          expected_duration,
+                          *actual_duration);
+            failed = 1;
+        }
+    }
+
+    avformat_close_input(&input);
+    return failed ? -1 : 0;
+}
+
 static int encode_audio(encode_ctx_t *ctx)
 {
     char key[27];
@@ -1537,7 +1664,7 @@ static int encode_audio(encode_ctx_t *ctx)
             pkt.stream_index = stream->index;
             if (av_interleaved_write_frame(ctx->oc, &pkt)) {
                 mlt_log_fatal(MLT_CONSUMER_SERVICE(ctx->consumer), "error writing audio frame\n");
-                mlt_events_fire(ctx->properties, "consumer-fatal-error", mlt_event_data_none());
+                fire_fatal_error(ctx->properties);
                 return -1;
             }
             ctx->error_count = 0;
@@ -1605,7 +1732,7 @@ static int flush_audio_encoders(encode_ctx_t *ctx)
                 av_packet_unref(&pkt);
                 mlt_log_fatal(MLT_CONSUMER_SERVICE(ctx->consumer),
                               "error writing flushed audio packet\n");
-                mlt_events_fire(ctx->properties, "consumer-fatal-error", mlt_event_data_none());
+                fire_fatal_error(ctx->properties);
                 return -1;
             }
             av_packet_unref(&pkt);
@@ -2352,7 +2479,7 @@ static int encode_video(encode_ctx_t *enc_ctx,
     enc_ctx->video_pts = (double) enc_ctx->frame_count * av_q2d(enc_ctx->vcodec_ctx->time_base);
     if (ret) {
         mlt_log_fatal(service, "error writing video frame: %d\n", ret);
-        mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+        fire_fatal_error(properties);
         return -1;
     }
     if (AV_PIX_FMT_VAAPI == c->pix_fmt
@@ -2441,6 +2568,7 @@ static void *consumer_thread(void *arg)
     char key[27];
     enc_ctx->frame_meta_properties = mlt_properties_new();
     int header_written = 0;
+    int output_error = 0;
 
     // Check for user selected format first
     if (format != NULL)
@@ -2715,7 +2843,7 @@ static void *consumer_thread(void *arg)
         else if (!(fmt->flags & AVFMT_NOFILE)) {
             if (avio_open(&enc_ctx->oc->pb, filename, AVIO_FLAG_WRITE) < 0) {
                 mlt_log_error(MLT_CONSUMER_SERVICE(consumer), "Could not open '%s'\n", filename);
-                mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+                fire_fatal_error(properties);
                 goto on_fatal_error;
             }
         }
@@ -2723,7 +2851,7 @@ static void *consumer_thread(void *arg)
 
     // Last check - need at least one stream
     if (!enc_ctx->audio_st[0] && !enc_ctx->video_st) {
-        mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+        fire_fatal_error(properties);
         goto on_fatal_error;
     }
 
@@ -2739,7 +2867,7 @@ static void *consumer_thread(void *arg)
         converted_avframe = alloc_picture(pix_fmt, width, height);
         if (!converted_avframe) {
             mlt_log_error(MLT_CONSUMER_SERVICE(consumer), "failed to allocate video AVFrame\n");
-            mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+            fire_fatal_error(properties);
             goto on_fatal_error;
         }
     }
@@ -2759,7 +2887,7 @@ static void *consumer_thread(void *arg)
 #endif
         } else {
             mlt_log_error(MLT_CONSUMER_SERVICE(consumer), "failed to allocate audio AVFrame\n");
-            mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+            fire_fatal_error(properties);
             goto on_fatal_error;
         }
     }
@@ -2796,7 +2924,7 @@ static void *consumer_thread(void *arg)
                     mlt_log_error(MLT_CONSUMER_SERVICE(consumer),
                                   "Could not write header '%s'\n",
                                   filename);
-                    mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+                    fire_fatal_error(properties);
                     goto on_fatal_error;
                 }
 
@@ -3009,7 +3137,7 @@ static void *consumer_thread(void *arg)
                 if (av_interleaved_write_frame(enc_ctx->oc, &pkt) != 0) {
                     mlt_log_fatal(MLT_CONSUMER_SERVICE(consumer),
                                   "error writing flushed video frame\n");
-                    mlt_events_fire(properties, "consumer-fatal-error", mlt_event_data_none());
+                    fire_fatal_error(properties);
                     goto on_fatal_error;
                 }
             }
@@ -3018,12 +3146,18 @@ static void *consumer_thread(void *arg)
 
 on_fatal_error:
 
+    if (mlt_properties_get_int(properties, "melt_error")
+        || mlt_properties_get_int(properties, "_output_error"))
+        output_error = 1;
+
     if (frame)
         mlt_frame_close(frame);
 
     // Write the trailer, if any
-    if (frames)
-        av_write_trailer(enc_ctx->oc);
+    if (header_written && av_write_trailer(enc_ctx->oc) < 0) {
+        mlt_log_error(MLT_CONSUMER_SERVICE(consumer), "failed to write container trailer\n");
+        output_error = 1;
+    }
 
     // Clean up input and output frames
     if (converted_avframe)
@@ -3053,12 +3187,64 @@ on_fatal_error:
 
     // Close the output file
     if (!(fmt->flags & AVFMT_NOFILE) && !mlt_properties_get_int(properties, "redirect")) {
-        if (enc_ctx->oc->pb)
-            avio_close(enc_ctx->oc->pb);
+        if (enc_ctx->oc->pb && avio_close(enc_ctx->oc->pb) < 0) {
+            mlt_log_error(MLT_CONSUMER_SERVICE(consumer), "failed to close output file\n");
+            output_error = 1;
+        }
+        sync_output_file(filename);
     }
+
+    // Validate the result before reporting completion. Only valid for local,
+    // seekable files; live streams and custom outputs are skipped.
+    if (mlt_properties_get_int(properties, "verify") || (!mlt_properties_exists(properties, "verify")
+                                                       && enc_ctx->terminate_on_pause
+                                                       && real_time_output <= 0)) {
+        int64_t actual_frames = -1;
+        double actual_duration = 0.0;
+        double expected_duration = 0.0;
+        int64_t expected_frames = enc_ctx->video_st ? enc_ctx->frame_count : 0;
+        mlt_producer producer = MLT_PRODUCER(
+            mlt_service_producer(MLT_CONSUMER_SERVICE(consumer)));
+
+        // When connected to a producer, its playtime is the authoritative
+        // expected frame count. This detects an interrupted render even though
+        // the encoder still produced a valid (but short) file.
+        if (producer && expected_frames > 0) {
+            mlt_position playtime = mlt_producer_get_playtime(producer);
+            if (playtime > 0 && playtime >= expected_frames)
+                expected_frames = playtime;
+        }
+
+        if (expected_frames > 0 && fps > 0.0)
+            expected_duration = expected_frames / fps;
+        else if (total_time > 0)
+            expected_duration = total_time / 1000000.0;
+
+        if (verify_output(consumer,
+                          filename,
+                          expected_frames,
+                          expected_duration,
+                          &actual_frames,
+                          &actual_duration)
+            < 0)
+            output_error = 1;
+
+        mlt_properties_set_int64(properties, "_rendered_frames", expected_frames);
+        mlt_properties_set_double(properties, "_rendered_duration", expected_duration);
+        mlt_properties_set_int64(properties, "_output_frames", actual_frames);
+        mlt_properties_set_double(properties, "_output_duration", actual_duration);
+        mlt_properties_set_int(properties, "_output_error", output_error);
+    }
+
+    // Never leave a file behind that can be mistaken for a complete render.
+    if (output_error || (!header_written && frames == 0))
+        remove_output_file(filename);
 
     // Free the stream
     av_free(enc_ctx->oc);
+
+    if (output_error)
+        fire_fatal_error(properties);
 
     // Just in case we terminated on pause
     mlt_consumer_stopped(consumer);
